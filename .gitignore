@@ -58,3 +58,6 @@ tmp/
 *.env
 .pypirc
 secrets.toml
+
+#Mac specific
+.DS_Store

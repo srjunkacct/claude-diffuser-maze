@@ -114,7 +114,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>com.diffuser.Main</mainClass>
+                            <mainClass>com.technodrome.Main</mainClass>
                         </manifest>
                     </archive>
                 </configuration>
