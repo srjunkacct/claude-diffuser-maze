@@ -24,6 +24,7 @@ target/
 *.log
 /logs/
 /temp/
+diffuser-java/results/
 
 # Python virtual environment
 venv/
@@ -61,3 +62,6 @@ secrets.toml
 
 #Mac specific
 .DS_Store
+
+#Claude
+.claude/

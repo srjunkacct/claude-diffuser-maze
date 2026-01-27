@@ -14,6 +14,7 @@ import ai.djl.training.dataset.RandomAccessDataset;
 import ai.djl.training.optimizer.Optimizer;
 import ai.djl.training.tracker.Tracker;
 import ai.djl.translate.TranslateException;
+import ai.djl.pytorch.jni.JniUtils;
 
 import com.technodrome.models.GaussianDiffusion;
 import com.technodrome.models.helpers.WeightedLoss;
@@ -82,6 +83,36 @@ public class DiffusionTrainer {
         model.initialize(manager, DataType.FLOAT32, inputShape);
         model.initializeParameters(manager);
 
+        // Enable gradient tracking on trainable parameters
+        // Use blacklist approach: enable gradients on everything EXCEPT known non-trainable params
+        int enabledCount = 0;
+        int skippedCount = 0;
+        System.out.println("[ training ] Processing parameters:");
+        for (var pair : model.getParameters()) {
+            String paramName = pair.getKey();
+            String paramNameLower = paramName.toLowerCase();
+            // Skip BatchNorm running statistics and tracking counters
+            // These cause "not differentiable with respect to running_mean" errors
+            boolean isNonTrainable = paramNameLower.contains("running_mean") ||
+                                     paramNameLower.contains("running_var") ||
+                                     paramNameLower.contains("runningmean") ||
+                                     paramNameLower.contains("runningvar") ||
+                                     paramNameLower.contains("num_batches") ||
+                                     paramNameLower.contains("numbatches");
+            if (!isNonTrainable) {
+                pair.getValue().getArray().setRequiresGradient(true);
+                enabledCount++;
+                if (enabledCount <= 10) {
+                    System.out.printf("  [enabled] %s%n", paramName);
+                }
+            } else {
+                skippedCount++;
+                System.out.printf("  [skipped] %s%n", paramName);
+            }
+        }
+        System.out.printf("[ training ] Enabled gradients on %d parameters, skipped %d non-trainable%n",
+                          enabledCount, skippedCount);
+
         // Create EMA model as a deep copy
         // Note: In DJL, creating a true deep copy of a Block is complex
         // For simplicity, we'll use the same model structure
@@ -123,48 +154,64 @@ public class DiffusionTrainer {
 
     /**
      * Run training loop.
+     * Uses global manager - tensors are freed by PyTorch's native memory management
+     * when no longer referenced, plus explicit CUDA cache clearing.
      */
     public void train(int nTrainSteps) throws IOException, TranslateException {
         Timer timer = new Timer();
 
-        // Create data iterator
-        Iterator<Batch> dataIterator = createDataIterator();
-
         for (int trainStep = 0; trainStep < nTrainSteps; trainStep++) {
-            float accumulatedLoss = 0;
+            float lossValue;
 
+            // Get batch data using global manager
+            Iterator<Batch> dataIterator = dataset.getData(manager).iterator();
+            if (!dataIterator.hasNext()) {
+                continue; // Skip if no data
+            }
+            Batch batch = dataIterator.next();
+
+            // Single forward-backward pass
             try (GradientCollector gc = Engine.getInstance().newGradientCollector()) {
-                for (int i = 0; i < gradientAccumulateEvery; i++) {
-                    // Get next batch
-                    if (!dataIterator.hasNext()) {
-                        dataIterator = createDataIterator();
-                    }
-                    Batch batch = dataIterator.next();
+                NDList data = batch.getData();
+                NDArray trajectories = data.get(0);
+                NDArray conditions = data.get(1);
 
-                    NDList data = batch.getData();
-                    NDArray trajectories = data.get(0);
-                    NDArray conditions = data.get(1);
+                // Create conditions map
+                Map<Integer, NDArray> condMap = new HashMap<>();
+                condMap.put(0, conditions);
 
-                    // Create conditions map
-                    Map<Integer, NDArray> condMap = new HashMap<>();
-                    condMap.put(0, conditions);
+                // Compute loss
+                WeightedLoss.LossResult result = model.loss(parameterStore, trajectories, condMap, true);
+                lossValue = result.loss.getFloat();
 
-                    // Compute loss
-                    WeightedLoss.LossResult result = model.loss(parameterStore, trajectories, condMap, true);
-                    NDArray loss = result.loss.div(gradientAccumulateEvery);
+                // Debug: print loss info on first step
+                if (step == 0) {
+                    System.out.printf("[ debug ] Loss shape: %s, hasGradient: %b%n",
+                                      result.loss.getShape(), result.loss.hasGradient());
+                }
 
-                    // Backward pass
-                    gc.backward(loss);
+                // Backward pass
+                gc.backward(result.loss);
+            } // GradientCollector closes here - releases computation graph
 
-                    accumulatedLoss += result.loss.getFloat();
+            // Close batch to free batch tensors
+            batch.close();
 
-                    batch.close();
+            // Update parameters using simple SGD (all in-place operations)
+            for (var pair : model.getParameters()) {
+                NDArray param = pair.getValue().getArray();
+                if (param.hasGradient()) {
+                    NDArray grad = param.getGradient();
+                    // In-place: grad *= lr, then param -= grad
+                    grad.muli(learningRate);
+                    param.subi(grad);
+                    // Zero gradient (in-place) for next iteration
+                    grad.muli(0);
                 }
             }
 
-            // Optimizer step
-            // Note: In DJL, optimizer step is typically done through Trainer API
-            // This is a simplified version
+            // Clear CUDA cache to return freed memory to allocator
+            JniUtils.emptyCudaCache();
 
             // Update EMA
             if (step % updateEmaEvery == 0) {
@@ -179,7 +226,17 @@ public class DiffusionTrainer {
             // Log progress
             if (step % logFreq == 0) {
                 double elapsed = timer.elapsed();
-                System.out.printf("%d: %.4f | t: %.4f%n", step, accumulatedLoss, elapsed);
+
+                // Memory stats
+                Runtime runtime = Runtime.getRuntime();
+                long usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024);
+                long maxMemory = runtime.maxMemory() / (1024 * 1024);
+
+                System.out.printf("%d: %.4f | t: %.4f | mem: %dMB/%dMB%n",
+                                  step, lossValue, elapsed, usedMemory, maxMemory);
+
+                // Periodic garbage collection
+                System.gc();
             }
 
             step++;

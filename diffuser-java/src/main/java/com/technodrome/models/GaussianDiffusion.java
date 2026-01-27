@@ -1,5 +1,6 @@
 package com.technodrome.models;
 
+import ai.djl.MalformedModelException;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
 import ai.djl.ndarray.NDManager;
@@ -8,6 +9,10 @@ import ai.djl.ndarray.types.Shape;
 import ai.djl.nn.AbstractBlock;
 import ai.djl.training.ParameterStore;
 import ai.djl.util.PairList;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 
 import com.technodrome.models.helpers.DiffusionHelpers;
 import com.technodrome.models.helpers.WeightedLoss;
@@ -108,7 +113,7 @@ public class GaussianDiffusion extends AbstractBlock {
         this.posteriorVariance = numerator.div(denominator);
 
         // Log calculation clipped because posterior variance is 0 at start
-        this.posteriorLogVarianceClipped = posteriorVariance.clip(1e-20, Double.MAX_VALUE).log();
+        this.posteriorLogVarianceClipped = posteriorVariance.clip(1e-20, Float.MAX_VALUE).log();
 
         this.posteriorMeanCoef1 = betas.mul(alphasCumprodPrev.sqrt()).div(alphasCumprod.neg().add(1));
         NDArray alphasSqrt = alphas.sqrt();
@@ -330,10 +335,12 @@ public class GaussianDiffusion extends AbstractBlock {
 
     /**
      * Compute training loss.
+     * Note: Caller is responsible for managing tensor lifecycle.
      */
     public WeightedLoss.LossResult pLosses(ParameterStore parameterStore, NDArray xStart,
                                            Map<Integer, NDArray> cond, NDArray t, boolean training) {
         NDManager manager = xStart.getManager();
+
         NDArray noise = manager.randomNormal(xStart.getShape());
 
         NDArray xNoisy = qSample(xStart, t, noise);
@@ -345,11 +352,14 @@ public class GaussianDiffusion extends AbstractBlock {
         NDArray xRecon = modelOut.singletonOrThrow();
         xRecon = DiffusionHelpers.applyConditioning(xRecon, cond, actionDim);
 
+        WeightedLoss.LossResult result;
         if (predictEpsilon) {
-            return lossFn.forward(xRecon, noise);
+            result = lossFn.forward(xRecon, noise);
         } else {
-            return lossFn.forward(xRecon, xStart);
+            result = lossFn.forward(xRecon, xStart);
         }
+
+        return result;
     }
 
     /**
@@ -386,6 +396,36 @@ public class GaussianDiffusion extends AbstractBlock {
     public Shape[] getOutputShapes(Shape[] inputShapes) {
         long batchSize = inputShapes[0].get(0);
         return new Shape[]{new Shape(batchSize, horizon, transitionDim)};
+    }
+
+    @Override
+    protected void initializeChildBlocks(NDManager manager, DataType dataType, Shape... inputShapes) {
+        // inputShapes[0] is [batch, horizon, transitionDim]
+        Shape xShape = inputShapes[0];
+        long batchSize = xShape.get(0);
+
+        // The model (TemporalUnet) expects inputs: [x, cond, time]
+        // x: [batch, horizon, transitionDim]
+        // cond: [batch, observationDim] (conditioning observations)
+        // time: [batch] (diffusion timesteps)
+        Shape condShape = new Shape(batchSize, observationDim);
+        Shape timeShape = new Shape(batchSize);
+
+        model.initialize(manager, dataType, xShape, condShape, timeShape);
+    }
+
+    @Override
+    protected void saveMetadata(DataOutputStream os) throws IOException {
+        os.writeInt(horizon);
+        os.writeInt(observationDim);
+        os.writeInt(actionDim);
+        os.writeInt(nTimesteps);
+    }
+
+    @Override
+    public void loadMetadata(byte version, DataInputStream is)
+            throws IOException, MalformedModelException {
+        // Metadata is loaded via constructor, this is for compatibility
     }
 
     // Getters

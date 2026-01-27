@@ -1,5 +1,7 @@
 package com.technodrome;
 
+import ai.djl.Device;
+import ai.djl.engine.Engine;
 import ai.djl.ndarray.NDManager;
 
 import com.technodrome.datasets.DatasetLoader;
@@ -19,6 +21,17 @@ public class Main {
     public static void main(String[] args) {
         System.out.println("Diffuser Java - Diffusion Models for Offline RL");
         System.out.println("================================================");
+
+        // Check GPU availability
+        Engine engine = Engine.getInstance();
+        System.out.printf("Engine: %s%n", engine.getEngineName());
+        System.out.printf("GPU available: %b%n", engine.getGpuCount() > 0);
+        System.out.printf("GPU count: %d%n", engine.getGpuCount());
+        Device device = engine.defaultDevice();
+        System.out.printf("Default device: %s%n", device);
+        if (!device.isGpu()) {
+            System.out.println("WARNING: Running on CPU! Training will be slow.");
+        }
 
         // Configuration
         int horizon = 32;
@@ -81,20 +94,23 @@ public class Main {
             System.out.println("Models created successfully!");
 
             // Create trainer
+            // Note: Reduce batch size if running out of GPU memory
             System.out.println("\nCreating trainer...");
+            int trainingBatchSize = 8;  // Reduced from 32 to help with memory
             DiffusionTrainer trainer = DiffusionTrainer.builder()
                     .setModel(diffusion)
                     .setDataset(dataset)
-                    .setBatchSize(32)
+                    .setBatchSize(trainingBatchSize)
                     .setLearningRate(2e-5f)
                     .setResultsFolder("./results")
                     .build();
+            System.out.printf("Training batch size: %d%n", trainingBatchSize);
 
             System.out.println("Trainer created successfully!");
 
             // Note: Actual training would be done with:
-            // trainer.initialize(manager);
-            // trainer.train(10000);
+            trainer.initialize(manager);
+            trainer.train(10000);
 
             System.out.println("\n================================================");
             System.out.println("Setup complete! Ready for training.");

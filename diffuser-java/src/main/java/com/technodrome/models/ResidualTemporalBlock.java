@@ -1,7 +1,10 @@
 package com.technodrome.models;
 
+import ai.djl.MalformedModelException;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
+import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.nn.AbstractBlock;
 import ai.djl.nn.Block;
@@ -11,6 +14,10 @@ import ai.djl.nn.convolutional.Conv1d;
 import ai.djl.nn.core.Linear;
 import ai.djl.training.ParameterStore;
 import ai.djl.util.PairList;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 
 import com.technodrome.models.helpers.Conv1dBlock;
 import com.technodrome.models.helpers.Mish;
@@ -23,6 +30,8 @@ public class ResidualTemporalBlock extends AbstractBlock {
 
     private static final byte VERSION = 1;
 
+    private final int inChannels;
+    private final int outChannels;
     private final Conv1dBlock block1;
     private final Conv1dBlock block2;
     private final SequentialBlock timeMlp;
@@ -34,6 +43,9 @@ public class ResidualTemporalBlock extends AbstractBlock {
 
     public ResidualTemporalBlock(int inChannels, int outChannels, int embedDim, int horizon, int kernelSize) {
         super(VERSION);
+
+        this.inChannels = inChannels;
+        this.outChannels = outChannels;
 
         this.block1 = new Conv1dBlock(inChannels, outChannels, kernelSize);
         addChildBlock("block1", block1);
@@ -93,5 +105,44 @@ public class ResidualTemporalBlock extends AbstractBlock {
     public Shape[] getOutputShapes(Shape[] inputShapes) {
         // Output shape matches first conv block output
         return block1.getOutputShapes(new Shape[]{inputShapes[0]});
+    }
+
+    @Override
+    protected void initializeChildBlocks(NDManager manager, DataType dataType, Shape... inputShapes) {
+        // inputs: [xShape, tShape]
+        // x: [batch, inChannels, horizon]
+        // t: [batch, embedDim]
+        Shape xShape = inputShapes[0];
+        Shape tShape = inputShapes[1];
+
+        long batchSize = xShape.get(0);
+        long horizon = xShape.get(2);
+
+        // Initialize block1: [batch, inChannels, horizon] -> [batch, outChannels, horizon]
+        block1.initialize(manager, dataType, xShape);
+
+        // Initialize timeMlp: [batch, embedDim] -> [batch, outChannels]
+        timeMlp.initialize(manager, dataType, tShape);
+
+        // Initialize block2: [batch, outChannels, horizon] -> [batch, outChannels, horizon]
+        Shape afterBlock1 = new Shape(batchSize, outChannels, horizon);
+        block2.initialize(manager, dataType, afterBlock1);
+
+        // Initialize residualConv: [batch, inChannels, horizon] -> [batch, outChannels, horizon]
+        if (inChannels != outChannels) {
+            residualConv.initialize(manager, dataType, xShape);
+        }
+    }
+
+    @Override
+    protected void saveMetadata(DataOutputStream os) throws IOException {
+        os.writeInt(inChannels);
+        os.writeInt(outChannels);
+    }
+
+    @Override
+    public void loadMetadata(byte version, DataInputStream is)
+            throws IOException, MalformedModelException {
+        // Metadata is loaded via constructor
     }
 }

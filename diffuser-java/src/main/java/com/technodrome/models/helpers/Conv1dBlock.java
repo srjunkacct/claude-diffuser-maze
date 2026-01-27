@@ -2,6 +2,8 @@ package com.technodrome.models.helpers;
 
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
+import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.nn.AbstractBlock;
 import ai.djl.nn.convolutional.Conv1d;
@@ -68,5 +70,16 @@ public class Conv1dBlock extends AbstractBlock {
     public Shape[] getOutputShapes(Shape[] inputShapes) {
         Shape[] convShapes = conv.getOutputShapes(inputShapes);
         return convShapes;  // BatchNorm and Mish preserve shape
+    }
+
+    @Override
+    protected void initializeChildBlocks(NDManager manager, DataType dataType, Shape... inputShapes) {
+        // input: [batch, inChannels, horizon]
+        conv.initialize(manager, dataType, inputShapes);
+
+        // Get output shape from conv for batchNorm and mish
+        Shape[] convOutputShapes = conv.getOutputShapes(inputShapes);
+        batchNorm.initialize(manager, dataType, convOutputShapes);
+        mish.initialize(manager, dataType, convOutputShapes);
     }
 }

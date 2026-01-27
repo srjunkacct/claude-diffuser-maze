@@ -19,6 +19,7 @@ public final class DiffusionHelpers {
 
     /**
      * Extract values from array a at indices t, and reshape for broadcasting.
+     * Result is attached to the same manager as t (typically the batch manager).
      *
      * @param a       1D array of values indexed by timestep
      * @param t       batch of timestep indices [batch_size]
@@ -26,6 +27,8 @@ public final class DiffusionHelpers {
      * @return extracted values reshaped for broadcasting
      */
     public static NDArray extract(NDArray a, NDArray t, Shape xShape) {
+        NDManager targetManager = t.getManager();
+
         // Gather values: out = a[t]
         NDArray out = a.get(t);
 
@@ -37,7 +40,11 @@ public final class DiffusionHelpers {
             newShape[i] = 1;
         }
 
-        return out.reshape(newShape);
+        NDArray result = out.reshape(newShape);
+
+        // Ensure result is attached to the target (batch) manager, not the diffusion constants manager
+        result.attach(targetManager);
+        return result;
     }
 
     /**
@@ -80,23 +87,50 @@ public final class DiffusionHelpers {
     }
 
     /**
-     * Apply conditioning to trajectory.
+     * Apply conditioning to trajectory using masking (gradient-preserving).
      * Sets observation values at specified timesteps.
+     * All intermediate tensors are created on x's manager.
      *
      * @param x          trajectory tensor [batch, horizon, transition_dim]
      * @param conditions map of timestep -> observation values
      * @param actionDim  dimension of action space
-     * @return conditioned trajectory
+     * @return conditioned trajectory (attached to x's manager)
      */
     public static NDArray applyConditioning(NDArray x, Map<Integer, NDArray> conditions, int actionDim) {
-        NDArray result = x.duplicate();
+        if (conditions.isEmpty()) {
+            return x;
+        }
+
+        NDManager manager = x.getManager();
+        Shape shape = x.getShape();
+        long batchSize = shape.get(0);
+        long horizon = shape.get(1);
+        long transitionDim = shape.get(2);
+        long obsDim = transitionDim - actionDim;
+
+        // Create a mask: 1 where we keep original values, 0 where we apply conditioning
+        NDArray mask = manager.ones(shape);
+
+        // Create the conditioning values tensor (same shape as x, with zeros elsewhere)
+        NDArray condValues = manager.zeros(shape);
+
         for (Map.Entry<Integer, NDArray> entry : conditions.entrySet()) {
             int t = entry.getKey();
-            NDArray val = entry.getValue();
-            // Set x[:, t, actionDim:] = val
-            // This sets the observation part at timestep t
-            result.set(new NDIndex(":, {}, {}:", t, actionDim), val);
+            NDArray val = entry.getValue();  // [batch, obs_dim]
+
+            // Set mask to 0 for the observation dimensions at timestep t
+            NDArray zeroMask = manager.zeros(new Shape(batchSize, obsDim));
+            mask.set(new NDIndex(":, {}, {}:", t, actionDim), zeroMask);
+
+            // Set conditioning values at timestep t
+            NDArray valReshaped = val.reshape(batchSize, obsDim);
+            condValues.set(new NDIndex(":, {}, {}:", t, actionDim), valReshaped);
         }
+
+        // Apply: result = x * mask + condValues
+        NDArray masked = x.mul(mask);
+        NDArray result = masked.add(condValues);
+
         return result;
     }
 }

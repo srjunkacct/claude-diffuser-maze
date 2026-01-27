@@ -1,7 +1,10 @@
 package com.technodrome.models;
 
+import ai.djl.MalformedModelException;
 import ai.djl.ndarray.NDArray;
 import ai.djl.ndarray.NDList;
+import ai.djl.ndarray.NDManager;
+import ai.djl.ndarray.types.DataType;
 import ai.djl.ndarray.types.Shape;
 import ai.djl.nn.AbstractBlock;
 import ai.djl.nn.Block;
@@ -11,6 +14,10 @@ import ai.djl.nn.convolutional.Conv1d;
 import ai.djl.nn.core.Linear;
 import ai.djl.training.ParameterStore;
 import ai.djl.util.PairList;
+
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
 
 import com.technodrome.models.helpers.Conv1dBlock;
 import com.technodrome.models.helpers.Downsample1d;
@@ -115,31 +122,28 @@ public class TemporalUnet extends AbstractBlock {
         addChildBlock("midBlock1", midBlock1);
         addChildBlock("midBlock2", midBlock2);
 
-        // Upsampling path
+        // Upsampling path - must have same number of upsamples as downsamples
+        // to restore original horizon (e.g., 3 downsamples needs 3 upsamples)
         this.ups = new ArrayList<>();
-        for (int ind = 0; ind < numResolutions - 1; ind++) {
-            int revInd = numResolutions - 2 - ind;
+        int numUpBlocks = numResolutions - 1;  // One less than down blocks (no up for last down)
+        for (int ind = 0; ind < numUpBlocks; ind++) {
+            int revInd = numUpBlocks - 1 - ind;
             int dimIn = inOut[revInd + 1][0];
             int dimOut = inOut[revInd + 1][1];
-            boolean isLast = ind >= numResolutions - 2;
 
             Block[] upBlock = new Block[3];
             // Input channels are doubled due to skip connection
             upBlock[0] = new ResidualTemporalBlock(dimOut * 2, dimIn, timeDim, currentHorizon);
             upBlock[1] = new ResidualTemporalBlock(dimIn, dimIn, timeDim, currentHorizon);
-            upBlock[2] = isLast ? Blocks.identityBlock() : new Upsample1d(dimIn);
+            // All up blocks upsample to restore original horizon
+            upBlock[2] = new Upsample1d(dimIn);
 
             addChildBlock("up_" + ind + "_resnet1", (AbstractBlock) upBlock[0]);
             addChildBlock("up_" + ind + "_resnet2", (AbstractBlock) upBlock[1]);
-            if (!isLast) {
-                addChildBlock("up_" + ind + "_upsample", (AbstractBlock) upBlock[2]);
-            }
+            addChildBlock("up_" + ind + "_upsample", (AbstractBlock) upBlock[2]);
 
             ups.add(upBlock);
-
-            if (!isLast) {
-                currentHorizon = currentHorizon * 2;
-            }
+            currentHorizon = currentHorizon * 2;
         }
 
         // Final convolution
@@ -232,5 +236,110 @@ public class TemporalUnet extends AbstractBlock {
     public Shape[] getOutputShapes(Shape[] inputShapes) {
         // Output shape is same as input shape
         return new Shape[]{inputShapes[0]};
+    }
+
+    @Override
+    protected void initializeChildBlocks(NDManager manager, DataType dataType, Shape... inputShapes) {
+        // inputShapes: [xShape, condShape, timeShape]
+        // x: [batch, horizon, transitionDim]
+        // cond: [batch, condDim]
+        // time: [batch]
+        Shape xShape = inputShapes[0];
+        Shape timeShape = inputShapes[2];
+
+        long batchSize = xShape.get(0);
+        long horizon = xShape.get(1);
+
+        // Initialize time MLP: input is [batch], output is [batch, dim]
+        timeMlp.initialize(manager, dataType, timeShape);
+        Shape tShape = new Shape(batchSize, dim);
+
+        // Calculate channel dimensions for tracking shapes through the network
+        int[] dims = new int[dimMults.length + 1];
+        dims[0] = transitionDim;
+        for (int i = 0; i < dimMults.length; i++) {
+            dims[i + 1] = dim * dimMults[i];
+        }
+
+        // x is transposed to [batch, transitionDim, horizon] in forward pass
+        long currentHorizon = horizon;
+        int currentChannels = transitionDim;
+
+        // Initialize downsampling blocks
+        for (int ind = 0; ind < downs.size(); ind++) {
+            Block[] downBlock = downs.get(ind);
+            int dimIn = dims[ind];
+            int dimOut = dims[ind + 1];
+            boolean isLast = ind >= downs.size() - 1;
+
+            ResidualTemporalBlock resnet1 = (ResidualTemporalBlock) downBlock[0];
+            ResidualTemporalBlock resnet2 = (ResidualTemporalBlock) downBlock[1];
+            Block downsample = downBlock[2];
+
+            // resnet1: [batch, dimIn, horizon] + [batch, timeDim] -> [batch, dimOut, horizon]
+            Shape xDownShape = new Shape(batchSize, dimIn, currentHorizon);
+            resnet1.initialize(manager, dataType, xDownShape, tShape);
+
+            // resnet2: [batch, dimOut, horizon] + [batch, timeDim] -> [batch, dimOut, horizon]
+            Shape xAfterRes1 = new Shape(batchSize, dimOut, currentHorizon);
+            resnet2.initialize(manager, dataType, xAfterRes1, tShape);
+
+            // downsample: [batch, dimOut, horizon] -> [batch, dimOut, horizon/2]
+            if (!isLast) {
+                downsample.initialize(manager, dataType, xAfterRes1);
+                currentHorizon = currentHorizon / 2;
+            }
+
+            currentChannels = dimOut;
+        }
+
+        // Initialize middle blocks
+        int midDim = dims[dims.length - 1];
+        Shape midShape = new Shape(batchSize, midDim, currentHorizon);
+        midBlock1.initialize(manager, dataType, midShape, tShape);
+        midBlock2.initialize(manager, dataType, midShape, tShape);
+
+        // Initialize upsampling blocks - all blocks upsample to restore original horizon
+        for (int ind = 0; ind < ups.size(); ind++) {
+            Block[] upBlock = ups.get(ind);
+            int revInd = ups.size() - 1 - ind;
+            int dimIn = dims[revInd + 1];
+            int dimOut = dims[revInd + 2];
+
+            ResidualTemporalBlock resnet1 = (ResidualTemporalBlock) upBlock[0];
+            ResidualTemporalBlock resnet2 = (ResidualTemporalBlock) upBlock[1];
+            Block upsample = upBlock[2];
+
+            // After concat with skip connection, channels are doubled
+            Shape xUpShape = new Shape(batchSize, dimOut * 2, currentHorizon);
+            resnet1.initialize(manager, dataType, xUpShape, tShape);
+
+            Shape xAfterRes1 = new Shape(batchSize, dimIn, currentHorizon);
+            resnet2.initialize(manager, dataType, xAfterRes1, tShape);
+
+            // All up blocks upsample
+            upsample.initialize(manager, dataType, xAfterRes1);
+            currentHorizon = currentHorizon * 2;
+        }
+
+        // Initialize final conv: [batch, dim, horizon] -> [batch, transitionDim, horizon]
+        Shape finalInShape = new Shape(batchSize, dim, currentHorizon);
+        finalConv.initialize(manager, dataType, finalInShape);
+    }
+
+    @Override
+    protected void saveMetadata(DataOutputStream os) throws IOException {
+        os.writeInt(transitionDim);
+        os.writeInt(dim);
+        os.writeInt(dimMults.length);
+        for (int m : dimMults) {
+            os.writeInt(m);
+        }
+    }
+
+    @Override
+    public void loadMetadata(byte version, DataInputStream is)
+            throws IOException, MalformedModelException {
+        // Metadata is loaded via constructor, this is for compatibility
     }
 }
